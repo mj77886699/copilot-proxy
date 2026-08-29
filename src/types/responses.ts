@@ -37,11 +37,18 @@ export interface ResponseContentPart {
   detail?: "low" | "high" | "auto";
 }
 
+/**
+ * Responses supports both function tools and provider built-ins (for example
+ * web search, MCP, computer use and local shell). Built-in tools have their
+ * own fields and must not be forced into the function-tool schema.
+ */
 export interface ResponseTool {
-  type: "function";
-  name: string;
+  type: string;
+  name?: string;
   description?: string;
-  parameters: Record<string, unknown>;
+  parameters?: Record<string, unknown>;
+  strict?: boolean | null;
+  [key: string]: unknown;
 }
 
 // --- Non-streaming Response ---

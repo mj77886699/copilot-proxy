@@ -281,6 +281,74 @@ function isCodexModel(model: string): boolean {
   return model.includes("-codex");
 }
 
+const COPILOT_RESPONSES_MIN_OUTPUT_TOKENS = 16;
+
+/** Normalize Responses API fields to the subset and limits accepted by Copilot. */
+export function prepareCopilotResponsesPayload(
+  payload: ResponsesPayload
+): ResponsesPayload {
+  const wirePayload: ResponsesPayload = { ...payload };
+  const requestedMax = wirePayload.max_output_tokens;
+
+  if (requestedMax == null) {
+    delete wirePayload.max_output_tokens;
+  } else if (Number.isFinite(requestedMax)) {
+    const modelMax = state.models?.data.find(
+      (model) => model.id === wirePayload.model
+    )?.capabilities.limits.max_output_tokens;
+    let normalizedMax = Math.max(
+      COPILOT_RESPONSES_MIN_OUTPUT_TOKENS,
+      Math.trunc(requestedMax)
+    );
+    if (modelMax != null) normalizedMax = Math.min(normalizedMax, modelMax);
+
+    if (normalizedMax !== requestedMax) {
+      logger.debug(
+        `Model ${wirePayload.model}: normalizing max_output_tokens from ${requestedMax} to ${normalizedMax}`
+      );
+    }
+    wirePayload.max_output_tokens = normalizedMax;
+  }
+
+  if (Array.isArray(wirePayload.tools) && wirePayload.tools.length === 0) {
+    delete wirePayload.tools;
+    delete wirePayload.tool_choice;
+  } else if (wirePayload.tools) {
+    wirePayload.tools = wirePayload.tools.map((tool, index) => {
+      const normalizedTool = { ...tool };
+
+      if (tool.type !== "function") {
+        // `parameters` belongs only to flat Responses function tools. Some
+        // clients attach an empty parameters object to every tool, which the
+        // Copilot /responses endpoint rejects for built-in/custom tools.
+        if (Object.hasOwn(normalizedTool, "parameters")) {
+          logger.debug(
+            `Responses tool ${index} (${tool.type}): removing function-only parameters`
+          );
+          delete normalizedTool.parameters;
+        }
+        return normalizedTool;
+      }
+
+      const parameters = normalizedTool.parameters;
+      const hasEmptyParameters =
+        parameters == null ||
+        (typeof parameters === "object" &&
+          !Array.isArray(parameters) &&
+          Object.keys(parameters).length === 0);
+      if (!hasEmptyParameters) return normalizedTool;
+
+      logger.debug(
+        `Responses function tool ${index} (${tool.name ?? "unnamed"}): normalizing empty parameters`
+      );
+      normalizedTool.parameters = { type: "object", properties: {} };
+      return normalizedTool;
+    });
+  }
+
+  return wirePayload;
+}
+
 /**
  * Send a request to the upstream /responses endpoint.
  * Returns either a parsed ResponsesResult (non-streaming) or an async iterable
@@ -300,18 +368,49 @@ export async function createResponses(
     "X-Initiator": "user",
   };
 
+  const wirePayload = prepareCopilotResponsesPayload(payload);
+  const upstreamRequestId = headers["x-request-id"];
+  logger.debug("Copilot responses wire request:", {
+    requestId: upstreamRequestId,
+    payload: wirePayload,
+  });
+
   const response = await fetch(`${copilotBaseUrl(state)}/responses`, {
     method: "POST",
     headers,
-    body: JSON.stringify(payload),
+    body: JSON.stringify(wirePayload),
   });
 
   if (!response.ok) {
-    logger.error("Failed to create responses:", response.status);
+    let errorBody = "<unable to read upstream response body>";
+    try {
+      errorBody = await response.clone().text();
+    } catch {
+      // Keep the original response body untouched for forwardError().
+    }
+    logger.error("Failed to create responses:", {
+      status: response.status,
+      statusText: response.statusText,
+      requestId: upstreamRequestId,
+      serviceRequestId: response.headers.get("x-copilot-service-request-id"),
+      responseRequestId: response.headers.get("x-request-id"),
+      githubRequestId: response.headers.get("x-github-request-id"),
+      model: wirePayload.model,
+      stream: Boolean(wirePayload.stream),
+      maxOutputTokens: wirePayload.max_output_tokens,
+      toolCount: wirePayload.tools?.length ?? 0,
+      tools: wirePayload.tools?.map((tool, index) => ({
+        index,
+        type: tool.type,
+        name: typeof tool.name === "string" ? tool.name : undefined,
+        keys: Object.keys(tool).sort(),
+      })),
+      body: errorBody,
+    });
     throw new HTTPError("Failed to create responses", response);
   }
 
-  if (payload.stream) {
+  if (wirePayload.stream) {
     return parseSSEStreamWithEvent(response);
   }
 

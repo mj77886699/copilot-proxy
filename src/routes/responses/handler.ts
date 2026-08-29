@@ -19,7 +19,18 @@ export async function handleResponses(c: Context) {
   const startTime = Date.now();
 
   const payload = await c.req.json<ResponsesPayload>();
-  logger.debug("Responses API request:", JSON.stringify(payload).slice(-400));
+  logger.debug("Responses API request:", {
+    model: payload.model,
+    stream: Boolean(payload.stream),
+    maxOutputTokens: payload.max_output_tokens,
+    toolCount: payload.tools?.length ?? 0,
+    tools: payload.tools?.map((tool, index) => ({
+      index,
+      type: tool.type,
+      name: typeof tool.name === "string" ? tool.name : undefined,
+      keys: Object.keys(tool).sort(),
+    })),
+  });
 
   if (isDeepseekModel(payload.model)) {
     const response = await createDeepseekCompletion(
